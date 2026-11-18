@@ -10,8 +10,8 @@ let S = EMPTY();
 try { const raw = localStorage.getItem(LS); if (raw) S = Object.assign(EMPTY(), JSON.parse(raw)); } catch(e){}
 
 const has = id => S.have.includes(id);
-const needs = id => S.need.includes(id);
-const onCustomList = label => S.custom.some(c => !c.done && c.name.toLowerCase() === label.toLowerCase());
+const needs = id => calOn() ? onCustomList(PNAME[id] || "") : S.need.includes(id);
+const onCustomList = label => listItems().some(c => !c.done && c.name.toLowerCase() === label.toLowerCase());
 function toggle(arr, id){ const i = S[arr].indexOf(id); if (i>-1) S[arr].splice(i,1); else S[arr].push(id); }
 
 /* ---------- huiscode (zit in de URL, zodat 'zet op beginscherm' hem meeneemt) ---------- */
@@ -69,8 +69,90 @@ async function pull(){
     setSync("Gedeeld en bijgewerkt", true);
   } catch(e){ setSync("Niet verbonden. Je ziet de laatst bewaarde versie."); }
 }
-document.addEventListener("visibilitychange", () => { if (!document.hidden) pull(); });
-setInterval(() => { if (!document.hidden) pull(); }, 20000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { pull(); calRefresh(); } });
+setInterval(() => { if (!document.hidden) { pull(); calRefresh(); } }, 20000);
+
+/* ---------- boodschappen via CalDAV (Radicale, zelfde lijst als Herinneringen) ---------- */
+// Gekoppeld: de lijst komt uit {caldav}{gebruiker}/boodschappen/ in plaats van S.need en S.custom.
+let CAL = null; try { CAL = JSON.parse(localStorage.getItem("sjef.caldav")); } catch(e){}
+let L = []; // open taken van de server, plus wat hier net is afgevinkt of nog onderweg is
+const calOn = () => Boolean(CAL && CFG.caldav);
+const listItems = () => calOn() ? L : S.custom;
+const calUrl = () => `${CFG.caldav}${encodeURIComponent(CAL.user)}/boodschappen/`;
+const dav = (method, url, body, headers) => fetch(url, {method, body, cache:"no-store", headers:Object.assign({Authorization:"Basic " + btoa(unescape(encodeURIComponent(CAL.user + ":" + CAL.pass)))}, headers)});
+const stamp = () => new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+/, "");
+const icsEsc = s => String(s).replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\n/g, "\\n");
+const icsUnesc = s => s.replace(/\\([\\;,nN])/g, (_, c) => c === "n" || c === "N" ? "\n" : c);
+const unfold = ics => ics.replace(/\r?\n[ \t]/g, "");
+function parseTodo(ics, url){
+  const body = (unfold(ics).match(/BEGIN:VTODO\r?\n([\s\S]*?)END:VTODO/) || [])[1]; if (!body) return null;
+  const get = k => { const m = body.match(new RegExp("^" + k + "(?:;[^:\\r\\n]*)?:(.*)$", "m")); return m ? m[1].replace(/\r$/, "") : ""; };
+  const status = get("STATUS").toUpperCase();
+  return {id:get("UID"), name:icsUnesc(get("SUMMARY")), note:icsUnesc(get("DESCRIPTION")), created:get("CREATED"), url, ics,
+    done: Boolean(get("COMPLETED")) || status === "COMPLETED" || status === "CANCELLED"};
+}
+function setDoneIcs(ics, done){
+  const s = stamp();
+  const out = unfold(ics).split(/\r?\n/).filter(l => !/^(STATUS|COMPLETED|PERCENT-COMPLETE|LAST-MODIFIED|DTSTAMP)[;:]/i.test(l));
+  out.splice(out.indexOf("END:VTODO"), 0, `DTSTAMP:${s}`, `LAST-MODIFIED:${s}`, done ? "STATUS:COMPLETED" : "STATUS:NEEDS-ACTION", ...(done ? [`COMPLETED:${s}`, "PERCENT-COMPLETE:100"] : []));
+  return out.join("\r\n");
+}
+const QUERY = `<?xml version="1.0" encoding="utf-8"?><C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:prop><D:getetag/><C:calendar-data/></D:prop><C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VTODO"><C:prop-filter name="COMPLETED"><C:is-not-defined/></C:prop-filter></C:comp-filter></C:comp-filter></C:filter></C:calendar-query>`;
+async function calPull(){
+  const res = await dav("REPORT", calUrl(), QUERY, {Depth:"1", "Content-Type":"application/xml; charset=utf-8"});
+  if (!res.ok) throw new Error(res.status);
+  const doc = new DOMParser().parseFromString(await res.text(), "application/xml");
+  const fresh = [...doc.getElementsByTagNameNS("DAV:", "response")].map(r => {
+    const href = r.getElementsByTagNameNS("DAV:", "href")[0], data = r.getElementsByTagNameNS("urn:ietf:params:xml:ns:caldav", "calendar-data")[0];
+    return href && data ? parseTodo(data.textContent, new URL(href.textContent, CFG.caldav).href) : null;
+  }).filter(t => t && t.id && !t.done);
+  const pos = t => { const i = L.findIndex(x => x.id === t.id); return i < 0 ? 1e9 : i; }; // CREATED telt in seconden: bij gelijke tijd de volgorde van hier
+  fresh.sort((a, b) => a.created.localeCompare(b.created) || pos(a) - pos(b));
+  const local = new Map(L.map(t => [t.id, t])), ids = new Set(fresh.map(t => t.id));
+  L = [...fresh.map(t => local.get(t.id) && local.get(t.id).pending ? local.get(t.id) : t), ...L.filter(t => !ids.has(t.id) && (t.done || t.pending))];
+}
+async function calPut(t){
+  t.pending = true;
+  try { const r = await dav("PUT", t.url, t.ics, {"Content-Type":"text/calendar; charset=utf-8"}); if (!r.ok) throw new Error(r.status); t.pending = false; calNote(""); }
+  catch(e){ t.pending = false; calNote("Kon de lijst in Herinneringen niet bijwerken. Probeer het zo nog eens."); }
+}
+function calAdd(name, from){
+  const id = crypto.randomUUID(), note = from ? "voor " + from : "", s = stamp();
+  const ics = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Sjef//NL", "BEGIN:VTODO", `UID:${id}`, `DTSTAMP:${s}`, `CREATED:${s}`, `LAST-MODIFIED:${s}`,
+    `SUMMARY:${icsEsc(name)}`, ...(note ? [`DESCRIPTION:${icsEsc(note)}`] : []), "STATUS:NEEDS-ACTION", "END:VTODO", "END:VCALENDAR", ""].join("\r\n");
+  const t = {id, name, note, created:s, url:calUrl() + id + ".ics", ics, done:false};
+  L.push(t); calPut(t);
+}
+function calSetDone(t, done){ t.done = done; t.ics = setDoneIcs(t.ics, done); calPut(t); }
+const pantryByName = name => Object.keys(PNAME).find(id => PNAME[id].toLowerCase() === name.trim().toLowerCase());
+const calDoneByName = name => L.filter(t => !t.done && t.name.toLowerCase() === name.toLowerCase()).forEach(t => calSetDone(t, true));
+function calNote(t){ const el = $("#calNote"); if (el) el.textContent = t; }
+async function calRefresh(){
+  if (!calOn()) return;
+  try { await calPull(); renderShop(); renderBadge(); renderPantry(); if (current) renderDetail(); }
+  catch(e){ calNote(e.message === "401" ? "Inloggen bij Herinneringen lukt niet meer. Ontkoppel en log opnieuw in." : "Geen verbinding met Herinneringen. Je ziet de laatst opgehaalde lijst."); }
+}
+function renderCal(){
+  $("#calForm").hidden = calOn(); $("#calOff").hidden = !calOn();
+  $("#calText").textContent = calOn() ? `Gekoppeld als ${CAL.user}. Deze lijst is Boodschappen in Herinneringen.` : "Koppel deze lijst aan Boodschappen in Herinneringen. Log in met je eigen account; het wachtwoord blijft op dit apparaat.";
+}
+async function calConnect(e){
+  e.preventDefault();
+  const f = e.target, prev = CAL;
+  CAL = {user:f.user.value.trim(), pass:f.pass.value};
+  calNote("Bezig met koppelen…");
+  try {
+    const r = await dav("PROPFIND", calUrl(), `<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:displayname/></D:prop></D:propfind>`, {Depth:"0", "Content-Type":"application/xml; charset=utf-8"});
+    if (!r.ok) throw new Error(r.status);
+  } catch(err){
+    CAL = prev;
+    calNote(err.message === "401" ? "Gebruiker of wachtwoord klopt niet." : err.message === "404" ? "Bij deze gebruiker staat geen lijst boodschappen." : "Geen verbinding met Herinneringen.");
+    return;
+  }
+  try { localStorage.setItem("sjef.caldav", JSON.stringify(CAL)); } catch(err){}
+  f.reset(); calNote(""); L = []; renderCal(); renderAll(); calRefresh();
+}
+function calLogout(){ CAL = null; L = []; try { localStorage.removeItem("sjef.caldav"); } catch(e){} renderCal(); renderAll(); }
 
 /* ---------- recepten (vaste + eigen) ---------- */
 const BUILTIN = R.slice();
@@ -200,8 +282,8 @@ function putOnList(keys, from){
   const added = [];
   keys.forEach(k => {
     const [kind, v] = k.split(/:(.+)/);
-    if (kind==="p" && !needs(v)) { S.need.push(v); added.push(PNAME[v]); }
-    if (kind==="c" && !onCustomList(v)) { const label = v.charAt(0).toUpperCase()+v.slice(1); S.custom.push({id:"c"+Date.now()+added.length, name:label, from, done:false}); added.push(label); }
+    if (kind==="p" && !needs(v)) { if (calOn()) calAdd(PNAME[v], from); else S.need.push(v); added.push(PNAME[v]); }
+    if (kind==="c" && !onCustomList(v)) { const label = v.charAt(0).toUpperCase()+v.slice(1); if (calOn()) calAdd(label, from); else S.custom.push({id:"c"+Date.now()+added.length, name:label, from, done:false}); added.push(label); }
   });
   return added;
 }
@@ -334,15 +416,15 @@ function renderPantry(){
 /* ---------- boodschappen ---------- */
 function renderShop(){
   const items = [
-    ...S.need.filter(id => PNAME[id]).map(id => ({key:"p:"+id, icon:PANTRY_ICON[id], name:PNAME[id], sub: USED[id] ? `voor ${USED[id].size} recept${USED[id].size>1?"en":""}` : "", done:false})),
-    ...S.custom.map(c => ({key:"c:"+c.id, icon:PANTRY_ICON[guessPantry(c.name)] || "bag", name:c.name, sub:c.from ? `voor ${c.from}` : "", done:c.done}))
+    ...(calOn() ? [] : S.need).filter(id => PNAME[id]).map(id => ({key:"p:"+id, icon:PANTRY_ICON[id], name:PNAME[id], sub: USED[id] ? `voor ${USED[id].size} recept${USED[id].size>1?"en":""}` : "", done:false})),
+    ...listItems().map(c => ({key:"c:"+c.id, icon:PANTRY_ICON[guessPantry(c.name)] || "bag", name:c.name, sub:c.note ?? (c.from ? `voor ${c.from}` : ""), done:c.done}))
   ];
   $("#shop").innerHTML = items.map(it => `<li class="${it.done ? "done" : ""}"><label><input type="checkbox" data-shop="${esc(it.key)}" ${it.done?"checked":""}>${icon(it.icon)}<span class="t"><span>${esc(it.name)}</span>${it.sub?`<small>${esc(it.sub)}</small>`:""}</span></label></li>`).join("");
   $("#shopEmpty").hidden = items.length > 0;
-  $("#clearDone").hidden = !S.custom.some(c=>c.done);
+  $("#clearDone").hidden = !listItems().some(c=>c.done);
 }
-function renderBadge(){ const n = S.need.length + S.custom.filter(c=>!c.done).length; const b = $("#lijstBadge"); b.hidden = !n; b.textContent = n; b.setAttribute("aria-label", `${n} te kopen`); }
-function addCustom(){ const v = $("#addInput").value.trim(); if (!v) return; S.custom.push({id:"c"+Date.now(), name:v, done:false}); $("#addInput").value=""; save(); renderShop(); renderBadge(); }
+function renderBadge(){ const n = (calOn() ? 0 : S.need.length) + listItems().filter(c=>!c.done).length; const b = $("#lijstBadge"); b.hidden = !n; b.textContent = n; b.setAttribute("aria-label", `${n} te kopen`); }
+function addCustom(){ const v = $("#addInput").value.trim(); if (!v) return; if (calOn()) calAdd(v); else S.custom.push({id:"c"+Date.now(), name:v, done:false}); $("#addInput").value=""; save(); renderShop(); renderBadge(); }
 
 /* ---------- delen ---------- */
 function renderShare(){ $("#houseCode").textContent = HOUSE; }
@@ -381,18 +463,20 @@ document.addEventListener("click", e => {
   else if (t.dataset.plan) { S.week.push(t.dataset.plan); save(); renderWeek(); }
   else if (t.dataset.unplan) { S.week = S.week.filter(x => x!==t.dataset.unplan); save(); renderWeek(); }
   else if (t.id === "planToList") planToList();
-  else if (t.dataset.have) { toggle("have", t.dataset.have); if (has(t.dataset.have)) S.need = S.need.filter(x=>x!==t.dataset.have); save(); renderAll(); }
-  else if (t.dataset.need) { toggle("need", t.dataset.need); save(); renderAll(); }
+  else if (t.dataset.have) { toggle("have", t.dataset.have); if (has(t.dataset.have)) { if (calOn()) calDoneByName(PNAME[t.dataset.have]); else S.need = S.need.filter(x=>x!==t.dataset.have); } save(); renderAll(); }
+  else if (t.dataset.need) { const id = t.dataset.need; if (!calOn()) toggle("need", id); else if (needs(id)) calDoneByName(PNAME[id]); else calAdd(PNAME[id]); save(); renderAll(); }
   else if (t.dataset.shop) {
     const [kind, id] = t.dataset.shop.split(/:(.+)/);
     if (kind==="p") { S.need = S.need.filter(x=>x!==id); if (!has(id)) S.have.push(id); }
+    else if (calOn()) { const c = L.find(c=>c.id===id); if (c) { calSetDone(c, t.checked); const p = pantryByName(c.name); if (t.checked && p && !has(p)) S.have.push(p); } }
     else { const c = S.custom.find(c=>c.id===id); if (c) c.done = t.checked; }
     save(); renderAll();
   }
   else if (t.id === "addBtn") addCustom();
-  else if (t.id === "clearDone") { S.custom = S.custom.filter(c=>!c.done); save(); renderShop(); }
+  else if (t.id === "clearDone") { if (calOn()) L = L.filter(c=>!c.done); else S.custom = S.custom.filter(c=>!c.done); save(); renderShop(); }
   else if (t.id === "shareBtn") shareHouse();
   else if (t.id === "joinBtn") joinHouse();
+  else if (t.id === "calLogout") calLogout();
   else if (t.dataset.tab) {
     document.querySelectorAll("nav.tabs button").forEach(b => b.setAttribute("aria-selected", b===t));
     ["recepten","week","voorraad","lijst"].forEach(v => $("#view-"+v).hidden = v!==t.dataset.tab);
@@ -400,6 +484,7 @@ document.addEventListener("click", e => {
   }
 });
 $("#rform").addEventListener("submit", submitForm);
+$("#calForm").addEventListener("submit", calConnect);
 $("#addInput").addEventListener("keydown", e => { if (e.key==="Enter") addCustom(); });
 $("#q").addEventListener("input", renderList);
 document.addEventListener("keydown", e => {
@@ -408,7 +493,7 @@ document.addEventListener("keydown", e => {
 });
 
 document.querySelectorAll("[data-icon]").forEach(el => { const svg = icon(el.dataset.icon); if (el.tagName==="SPAN") el.outerHTML = svg; else el.insertAdjacentHTML("afterbegin", svg); });
-rebuild(); renderAll(); renderShare(); pull();
+rebuild(); renderAll(); renderShare(); renderCal(); pull(); calRefresh();
 // iOS wil een PNG als beginscherm-icoon: teken de SVG één keer naar PNG.
 (() => { const img = new Image(); img.onload = () => { try { const c = document.createElement("canvas"); c.width = c.height = 180; c.getContext("2d").drawImage(img, 0, 0, 180, 180); $("#touchIcon").href = c.toDataURL("image/png"); } catch(e){} }; img.src = "icon.svg"; })();
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});

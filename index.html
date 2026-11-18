@@ -53,6 +53,18 @@
     <button class="rowbtn" id="clearDone" hidden>Afgevinkte weghalen</button>
 
     <div class="share">
+      <h2 class="sharetitle">Herinneringen</h2>
+      <p id="calText">Koppel deze lijst aan Boodschappen in Herinneringen. Log in met je eigen account; het wachtwoord blijft op dit apparaat.</p>
+      <form id="calForm">
+        <div class="addrow"><input name="user" type="text" autocomplete="username" autocapitalize="none" placeholder="Gebruiker" aria-label="Gebruiker" required></div>
+        <div class="addrow"><input name="pass" type="password" autocomplete="current-password" placeholder="Wachtwoord" aria-label="Wachtwoord" required></div>
+        <p class="note" id="calNote" aria-live="polite"></p>
+        <div class="btns" style="padding-top:20px"><button class="pill solid">Koppel</button></div>
+      </form>
+      <div class="btns" id="calOff" hidden><button class="pill" id="calLogout">Ontkoppel</button></div>
+    </div>
+
+    <div class="share">
       <h2 class="sharetitle">Samen gebruiken</h2>
       <p>Iedereen met jullie link ziet dezelfde voorraad, lijst, week en eigen recepten. Huiscode <code id="houseCode"></code></p>
       <div class="btns">
