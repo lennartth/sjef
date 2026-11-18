@@ -17,7 +17,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@300;400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="style.css?v=2">
 </head>
 <body>
 <main class="wrap">
@@ -55,7 +55,7 @@
     <div class="share">
       <h2 class="sharetitle">Herinneringen</h2>
       <p id="calText">Koppel deze lijst aan Boodschappen in Herinneringen. Log in met je eigen account; het wachtwoord blijft op dit apparaat.</p>
-      <form id="calForm">
+      <form id="calForm" onsubmit="return false">
         <div class="addrow"><input name="user" type="text" autocomplete="username" autocapitalize="none" placeholder="Gebruiker" aria-label="Gebruiker" required></div>
         <div class="addrow"><input name="pass" type="password" autocomplete="current-password" placeholder="Wachtwoord" aria-label="Wachtwoord" required></div>
         <p class="note" id="calNote" aria-live="polite"></p>
@@ -118,9 +118,9 @@
   </div>
 </nav>
 
-<script src="config.js"></script>
-<script src="icons.js"></script>
-<script src="data.js"></script>
-<script src="app.js"></script>
+<script src="config.js?v=2"></script>
+<script src="icons.js?v=2"></script>
+<script src="data.js?v=2"></script>
+<script src="app.js?v=2"></script>
 </body>
 </html>
